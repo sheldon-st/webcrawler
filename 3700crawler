@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import sys
+from html.parser import HTMLParser
+
+from urllib.parse import urlparse
+
+# connection variables 
+DEFAULT_SERVER = "proj5.3700.network"
+ROOT_URL = "/fakebook/"
+DEFAULT_PORT = 443
+CRLF = "\r\n\r\n"
+
+# socket constants
+RECV_MESSAGE_SIZE = 1024
+RESET_SOCKET_AFTER = 100
+
+# cookies
+SESSION_ID = None
+CSRF = None
+
+# store secret flags and other output
+SECRET_FLAGS = []
+FRONTIER = []
+DONT_VISIT = []
+
+# parse crawler information
+class ParsePage(HTMLParser):
+  """Parses a given HTML page and extracts the links and secret flags
+  """
+  def __init__(self):
+    super().__init__()
+    self.recording = 0
+    self.data = [] 
+
+  def handle_starttag(self, tag, attrs):
+    """ parse beginning of an element/tag
+
+    Input:
+        tag (string): the HTML element's tag classification
+        attrs (array): attributes in the element's start tag
+    """
+    global SECRET_FLAGS
+    global FRONTIER
+    global DONT_VISIT
+
+    if tag == 'a':
+      if len(attrs) == 0: pass
+      else:
+        for (variable, value) in attrs:
+          if variable == 'href' and value not in DONT_VISIT and value not in FRONTIER:
+            FRONTIER.append(value)
+    elif tag == 'h2':
+      if len(attrs) == 0: pass
+      else:
+        for (variable, value) in attrs:
+          if variable == 'class' and value == 'secret_flag':
+            self.recording = 1
+
+  def handle_data(self, data):
+    """ gets the data (value) of secret flags
+
+    Input:
+        data (string): contents of HTML element
+    """
+    if self.recording:
+      # Remove 'Flag: ' from the beginning of the flag
+      print(data[6:])
+      SECRET_FLAGS.append(data[6:])
+      self.recording = 0
+
+# crawls Fakebook
+class Crawler:
+    def __init__(self, args):
+      self.server = args.server
+      self.port = args.port
+      self.username = args.username
+      self.password = args.password
+      self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      self.request_counter = 101
+
+    # ---------------------------------------------------------------------------- #
+    #                         Basic communication functions                        #
+    # ---------------------------------------------------------------------------- #
+    
+    def open_socket(self):
+      """ Opens a socket to the server. """
+      mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      mysocket = ssl.create_default_context().wrap_socket(mysocket, server_hostname=DEFAULT_SERVER)
+      mysocket.settimeout(.5)
+      mysocket.connect((DEFAULT_SERVER, DEFAULT_PORT))
+
+      return mysocket
+
+
+    def recv_all(self, sock):
+      """ Receives all data from a socket and returns it.
+      
+      Args:
+      sock -- the socket to receive data from
+      """
+      data = ""
+
+      # Need to be able to recieve in chunks for HTTP/1.1
+      while True:
+        try:
+          chunk = sock.recv(RECV_MESSAGE_SIZE)
+          data += chunk.decode('ascii')
+          if len(chunk) < RECV_MESSAGE_SIZE:
+            break
+        except:
+          break
+
+      return data
+
+
+    def send(self, request):
+      """ Sends a request to the server and returns the response. 
+          
+      Args:
+      request -- the request to send to the server
+      """
+
+      sock = self.open_socket()
+      sock.send(request.encode('ascii'))
+      data = self.recv_all(sock)
+      sock.close()
+
+      return data
+
+    # ---------------------------------------------------------------------------- #
+    #                     Functions to facilitate login process                    #
+    # ---------------------------------------------------------------------------- #
+
+    def login(self): 
+      """ 
+      Handles the login process. Sends a GET request to the 
+      login page, parses the cookie, and sends a POST request to login. 
+      """
+
+      global SESSION_ID
+      global CSRF
+      global DONT_VISIT
+
+      # initial GET request to login page
+      login_request = "GET /accounts/login/ HTTP/1.0\r\n\r\n" \
+                      "Host: proj5.3700.network\n" \
+                      "Content-Type: application/x-www-form-urlencoded\n" \
+                      "Content-Length: 37\n" \
+                      "login=%s&password=%s" % (self.username, self.password)
+
+      # attempt to login until we successfully get cookies
+      while CSRF == None:
+        response = self.send(login_request)
+        self.get_cookies(response)
+
+      # POST request to login
+      request = "username=%s&password=%s&csrfmiddlewaretoken=%s&next=/fakebook/" % (self.username, self.password, CSRF)
+      login_response = self.post("/accounts/login/", request, self.generate_cookies())
+      self.get_cookies(login_response)
+
+      # don't visit the login page again
+      DONT_VISIT.append("/accounts/logout/")
+      DONT_VISIT.append("/accounts/login/")
+      
+
+    def post(self, url, data, cookies):
+      """ Sends a POST request to the server and returns the response.
+      
+      Args:
+      url -- the url to send the request to
+      data -- the url encoded data to send
+      cookies -- a string containing the cookies in the format "Cookie: <cookie1>; <cookie2>; ...'
+      """
+      body = "POST " + url + " HTTP/1.1\r\n" \
+             "Host: " + self.server + "\r\n" \
+             "Connection: close\r\n" \
+             "Content-Length: " + str(len(data)) + "\r\n" \
+             "Content-Type: application/x-www-form-urlencoded\r\n" \
+             "Cookie: " + cookies
+
+      request = body + CRLF + data + CRLF
+      return self.send(request)
+
+
+    # ------------------- Retrieve/ generate cookie data ------------------ #
+
+    def get_cookies(self, response):
+      """ Parses the server response and retrieves the cookie data. 
+      
+      Args:
+      response -- the server response
+      """
+      global SESSION_ID
+      global CSRF
+
+      # Get the session ID and CSRF token from the response headers
+      cookies = response.split("Set-Cookie: ")
+      SESSION_ID = cookies[2].split(";")[0].split("=")[1]
+      CSRF = cookies[1].split(";")[0].split("=")[1]
+
+
+    def generate_cookies(self):
+      """ Generates a string for the cookie header. """
+      ret = ""
+
+      # Checks which cookies are set and creates the cookie string accordingly
+      if CSRF:
+        ret += "csrftoken=%s" % (CSRF)
+        if SESSION_ID:
+            ret += "; sessionid=%s" % (SESSION_ID)
+      elif SESSION_ID:
+          ret = "sessionid=%s" % (SESSION_ID)
+      return ret
+
+
+
+    # ---------------------------------------------------------------------------- #
+    #                 Functions to facilitate the crawling process                 #
+    # ---------------------------------------------------------------------------- #
+
+    def crawl(self):
+      """ Crawls the website. """
+      
+      global FRONTIER
+      global SECRET_FLAGS
+      global DONT_VISIT
+
+      # Add the root url to the frontier
+      FRONTIER.append(ROOT_URL)
+      cookies = self.generate_cookies()
+      
+      # While there are still pages to visit and we haven't found all the flags
+      while len(FRONTIER) > 0 and len(SECRET_FLAGS) < 5:
+        # Get the next page to visit
+        url = FRONTIER.pop(0)
+
+        # Ensure that url does not begin with http or mailto
+        if url.startswith("http") or url.startswith("mailto"):
+          DONT_VISIT.append(url)
+        
+        # If we haven't DONT_VISIT this page yet
+        if url not in DONT_VISIT:
+
+          # Send a GET request to the page
+          response = self.get(url, cookies)
+
+          # Check if we recieve a 503 response to the GET request and retry
+          if "503 Service Unavailable" in response:
+            response = ""
+
+          if response != "":
+            # Parse the response
+            parser = ParsePage()
+            parser.feed(response)
+            parser.close()
+
+            # Add url to set of DONT_VISIT pages
+            DONT_VISIT.append(url)
+
+        else: 
+          pass
+
+
+    def get(self, url, cookies=None):
+      """ Sends a GET request to the server and returns the response.
+      
+      Args:
+      url -- the url to send the request to
+      cookies -- a string containing the cookies in the format "Cookie: <cookie1>; <cookie2>; ...' defaults to None
+      """
+
+      # Uses keep-alive to reduce the number of connections; resets the connection after RESET_SOCKET_AFTER requests
+      if self.request_counter > RESET_SOCKET_AFTER:
+        self.request_counter = 0
+        self.socket.close()
+        self.socket = self.open_socket()
+
+
+      # Creates message for GET request
+      message = "GET %s HTTP/1.1\nHost: %s\nConnection: keep-alive\nCookie: %s%s" % (url, DEFAULT_SERVER, cookies, CRLF)
+                
+      # Sends the GET request and receives the response
+      self.socket.send(message.encode('ascii'))
+      data = self.recv_all(self.socket)
+      self.request_counter += 1
+
+      return data
+
+
+
+    # ---------------------------------------------------------------------------- #
+    #                                     Main                                     #
+    # ---------------------------------------------------------------------------- #
+
+    def run(self):
+      """ Runs the crawler. """
+
+      # Login to the website
+      self.login()
+
+      # Begin crawling the website for flags
+      self.crawl()
+          
+        
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
